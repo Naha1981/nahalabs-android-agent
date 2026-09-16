@@ -22,24 +22,26 @@ WORKER_ID = os.getenv("NAHALABS_WORKER_ID", f"windows-{socket.gethostname()}")
 POLL_SECONDS = float(os.getenv("NAHALABS_POLL_SECONDS", "2"))
 
 
-def build_client() -> ArtemisClient:
+def build_client(*, profile: str | None = None, device_serial: str | None = None) -> ArtemisClient:
     if ArtemisClient is None:
         raise RuntimeError(
             "artemis-client is not installed. Run `uv sync` in services/windows-agent."
         )
     return ArtemisClient(
         ARTEMIS_URL,
-        device_serial=DEVICE_SERIAL,
-        default_profile=PROFILE,  # type: ignore[arg-type]
+        device_serial=device_serial or DEVICE_SERIAL,
+        default_profile=profile or PROFILE,  # type: ignore[arg-type]
     )
 
 
 async def execute(job: dict) -> dict:
-    client = build_client()
+    profile = job.get("profile") or PROFILE
+    device_serial = job.get("device_serial") or DEVICE_SERIAL
+    client = build_client(profile=profile, device_serial=device_serial)
     result = await client.run(
         job["instruction"],
-        profile=job.get("profile") or PROFILE,
-        device_serial=job.get("device_serial") or DEVICE_SERIAL,
+        profile=profile,
+        device_serial=device_serial,
         timeout=float(os.getenv("ARTEMIS_TASK_TIMEOUT", "900")),
     )
     return {
@@ -51,6 +53,7 @@ async def execute(job: dict) -> dict:
         "trace_id": result.trace_id,
         "output": result.output,
         "turns": result.turns,
+        "profile": profile,
     }
 
 
