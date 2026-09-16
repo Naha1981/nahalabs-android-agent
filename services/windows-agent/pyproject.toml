@@ -1,0 +1,8 @@
+[project]
+name = "nahalabs-windows-agent"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.28,<1",
+  "artemis-client @ git+https://github.com/google/artemis.git#subdirectory=packages/artemis-client",
+]
