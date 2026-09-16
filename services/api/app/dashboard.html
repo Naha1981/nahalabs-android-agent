@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NahaLabs AI Operator</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; background: #f4f6f8; color: #111827; }
+    header { padding: 28px 32px; background: #111827; color: white; }
+    main { max-width: 1050px; margin: 28px auto; padding: 0 20px; }
+    textarea { width: 100%; min-height: 110px; box-sizing: border-box; padding: 14px; border: 1px solid #cbd5e1; border-radius: 10px; }
+    button { margin-top: 10px; padding: 10px 16px; border: 0; border-radius: 8px; cursor: pointer; }
+    .primary { background: #111827; color: white; }
+    .job { padding: 16px; background: white; border-radius: 10px; margin: 10px 0; border: 1px solid #e5e7eb; }
+    .mono { font-family: ui-monospace, monospace; font-size: 12px; color: #64748b; }
+  </style>
+</head>
+<body>
+<header><strong>NahaLabs AI Operator</strong><div class="mono">Windows → Cloud → ARTEMIS → Android</div></header>
+<main>
+  <h2>Dispatch mobile work</h2>
+  <textarea id="instruction" placeholder="Example: Open the approved store-operations app and check today's opening checklist."></textarea>
+  <button class="primary" onclick="createJob()">Dispatch job</button>
+  <h2>Jobs</h2>
+  <div id="jobs">Loading…</div>
+</main>
+<script>
+async function createJob() {
+  const instruction = document.getElementById('instruction').value.trim();
+  if (!instruction) return;
+  await fetch('/v1/jobs', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({instruction, profile:'flash'}) });
+  document.getElementById('instruction').value = '';
+  loadJobs();
+}
+async function loadJobs() {
+  const jobs = await (await fetch('/v1/jobs')).json();
+  document.getElementById('jobs').innerHTML = jobs.map(j => `
+    <div class="job"><b>${escapeHtml(j.status)}</b> — ${escapeHtml(j.instruction)}<div class="mono">${escapeHtml(j.id)}</div></div>
+  `).join('') || '<p>No jobs yet.</p>';
+}
+function escapeHtml(value) {
+  return String(value).replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+}
+loadJobs();
+setInterval(loadJobs, 2000);
+</script>
+</body>
+</html>
