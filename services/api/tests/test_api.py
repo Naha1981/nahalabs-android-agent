@@ -42,3 +42,28 @@ def test_job_lifecycle():
     detail = client.get(f'/v1/jobs/{job_id}')
     assert detail.status_code == 200
     assert detail.json()['result']['succeeded'] is True
+
+
+def test_desktop_file_context_can_be_attached_to_job():
+    upload = client.post(
+        '/v1/files/ingest',
+        files={'file': ('stores.csv', 'store,task\n184,opening checklist\n185,refrigeration', 'text/csv')},
+    )
+    assert upload.status_code == 200
+    file_id = upload.json()['id']
+    assert upload.json()['rows'] == 2
+
+    created = client.post('/v1/jobs', json={
+        'instruction': 'Handle the store tasks listed in the attached business file.',
+        'profile': 'flash',
+        'source_file_id': file_id,
+        'row_limit': 2,
+    })
+    assert created.status_code == 200
+    assert created.json()['source_file_id'] == file_id
+    assert created.json()['context_rows'] == 2
+
+    job = client.get(f"/v1/jobs/{created.json()['id']}")
+    assert job.status_code == 200
+    assert len(job.json()['context']) == 2
+    assert 'stores.csv' in job.json()['instruction']
