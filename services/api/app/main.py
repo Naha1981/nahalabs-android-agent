@@ -24,7 +24,7 @@ def now() -> str:
 
 
 def db() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH)
+    connection = sqlite3.connect(DB_PATH, timeout=10)
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -53,10 +53,13 @@ def init_db() -> None:
                 rows_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_jobs_status_created
+                ON jobs(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_jobs_claimed_by
+                ON jobs(claimed_by);
             """
         )
 
-        # Lightweight forward migration for databases created by v0.1.
         columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
         if "source_file_id" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN source_file_id TEXT")
@@ -240,18 +243,34 @@ def get_job(job_id: str) -> dict[str, Any]:
 
 @app.post("/v1/jobs/claim")
 def claim_job(payload: ClaimJob) -> dict[str, Any] | None:
-    with db() as conn:
-        row = conn.execute(
+    connection = db()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
             "SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1"
         ).fetchone()
         if row is None:
+            connection.commit()
             return None
-        conn.execute(
-            "UPDATE jobs SET status='running', claimed_by=?, updated_at=? WHERE id=? AND status='queued'",
-            (payload.worker_id, now(), row["id"]),
+
+        timestamp = now()
+        updated = connection.execute(
+            """
+            UPDATE jobs
+            SET status='running', claimed_by=?, updated_at=?
+            WHERE id=? AND status='queued'
+            """,
+            (payload.worker_id, timestamp, row["id"]),
         )
-        row = conn.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
-    return dict(row)
+        if updated.rowcount != 1:
+            connection.rollback()
+            return None
+
+        claimed = connection.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
+        connection.commit()
+        return dict(claimed) if claimed else None
+    finally:
+        connection.close()
 
 
 @app.post("/v1/jobs/{job_id}/complete")
@@ -262,6 +281,8 @@ def complete_job(job_id: str, payload: CompleteJob) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="Job not found")
         if row["claimed_by"] != payload.worker_id:
             raise HTTPException(status_code=409, detail="Job is not owned by this worker")
+        if row["status"] not in {"running", "succeeded", "failed"}:
+            raise HTTPException(status_code=409, detail="Job is not executable")
         status = "failed" if payload.error else "succeeded"
         conn.execute(
             "UPDATE jobs SET status=?, result_json=?, error=?, updated_at=? WHERE id=?",
