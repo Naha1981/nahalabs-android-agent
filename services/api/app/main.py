@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ from pydantic import BaseModel, Field
 DB_PATH = Path(__file__).resolve().parent.parent / "data.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="NahaLabs AI Operator API", version="0.1.0")
+app = FastAPI(title="NahaLabs AI Operator API", version="0.2.0")
 
 
 def now() -> str:
@@ -42,7 +43,9 @@ def init_db() -> None:
                 result_json TEXT,
                 error TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                source_file_id TEXT,
+                context_json TEXT
             );
             CREATE TABLE IF NOT EXISTS ingested_files (
                 id TEXT PRIMARY KEY,
@@ -53,6 +56,13 @@ def init_db() -> None:
             """
         )
 
+        # Lightweight forward migration for databases created by v0.1.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "source_file_id" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN source_file_id TEXT")
+        if "context_json" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN context_json TEXT")
+
 
 init_db()
 
@@ -61,6 +71,8 @@ class CreateJob(BaseModel):
     instruction: str = Field(min_length=1, max_length=4000)
     profile: str = Field(default="flash", pattern="^(flash|pro)$")
     device_serial: str | None = None
+    source_file_id: str | None = None
+    row_limit: int = Field(default=20, ge=0, le=200)
 
 
 class ClaimJob(BaseModel):
@@ -108,8 +120,6 @@ async def ingest_file(file: UploadFile = File(...)) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Only CSV and XLSX are supported")
 
     file_id = str(uuid.uuid4())
-    import json
-
     with db() as conn:
         conn.execute(
             "INSERT INTO ingested_files VALUES (?, ?, ?, ?)",
@@ -119,16 +129,68 @@ async def ingest_file(file: UploadFile = File(...)) -> dict[str, Any]:
     return {"id": file_id, "filename": filename, "rows": len(rows), "preview": rows[:10]}
 
 
+@app.get("/v1/files")
+def list_files(limit: int = 50) -> list[dict[str, Any]]:
+    limit = max(1, min(limit, 200))
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, filename, created_at, length(rows_json) AS bytes FROM ingested_files ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/v1/files/{file_id}")
+def get_file(file_id: str, preview: int = 20) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM ingested_files WHERE id = ?", (file_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    rows = json.loads(row["rows_json"])
+    return {
+        "id": row["id"],
+        "filename": row["filename"],
+        "created_at": row["created_at"],
+        "rows": len(rows),
+        "preview": rows[: max(0, min(preview, 200))],
+    }
+
+
 @app.post("/v1/jobs")
 def create_job(payload: CreateJob) -> dict[str, Any]:
+    instruction = payload.instruction.strip()
+    context: list[dict[str, Any]] = []
+
+    if payload.source_file_id:
+        with db() as conn:
+            file_row = conn.execute(
+                "SELECT id, filename, rows_json FROM ingested_files WHERE id = ?",
+                (payload.source_file_id,),
+            ).fetchone()
+        if file_row is None:
+            raise HTTPException(status_code=404, detail="Source file not found")
+        rows = json.loads(file_row["rows_json"])
+        context = rows[: payload.row_limit] if payload.row_limit else []
+        context_block = json.dumps(context, ensure_ascii=False, default=str)
+        instruction = (
+            f"{instruction}\n\n"
+            f"Business file context ({file_row['filename']}, {len(rows)} total rows; "
+            f"showing {len(context)}):\n{context_block}"
+        )
+
     job_id = str(uuid.uuid4())
     timestamp = now()
     with db() as conn:
         conn.execute(
-            "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO jobs (
+                id, instruction, status, profile, device_serial, claimed_by,
+                result_json, error, created_at, updated_at, source_file_id, context_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 job_id,
-                payload.instruction,
+                instruction,
                 "queued",
                 payload.profile,
                 payload.device_serial,
@@ -137,9 +199,17 @@ def create_job(payload: CreateJob) -> dict[str, Any]:
                 None,
                 timestamp,
                 timestamp,
+                payload.source_file_id,
+                json.dumps(context, ensure_ascii=False, default=str),
             ),
         )
-    return {"id": job_id, "status": "queued", "created_at": timestamp}
+    return {
+        "id": job_id,
+        "status": "queued",
+        "created_at": timestamp,
+        "source_file_id": payload.source_file_id,
+        "context_rows": len(context),
+    }
 
 
 @app.get("/v1/jobs")
@@ -158,11 +228,13 @@ def get_job(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Job not found")
     item = dict(row)
     if item["result_json"]:
-        import json
-
         item["result"] = json.loads(item.pop("result_json"))
     else:
         item.pop("result_json")
+    if item.get("context_json"):
+        item["context"] = json.loads(item.pop("context_json"))
+    else:
+        item.pop("context_json", None)
     return item
 
 
@@ -184,8 +256,6 @@ def claim_job(payload: ClaimJob) -> dict[str, Any] | None:
 
 @app.post("/v1/jobs/{job_id}/complete")
 def complete_job(job_id: str, payload: CompleteJob) -> dict[str, Any]:
-    import json
-
     with db() as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
