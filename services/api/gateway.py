@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import uuid
 from typing import Any
 
@@ -104,7 +103,7 @@ def record_event(job_id: str, actor: str, event_type: str, payload: dict[str, An
 
 def sync_office_ticket(job_id: str, status: str, payload: dict[str, Any]) -> None:
     with db() as conn:
-        job = conn.execute("SELECT office_system, office_ticket_id FROM jobs WHERE id=?", (job_id,)).fetchone()
+        job = conn.execute("SELECT office_ticket_id FROM jobs WHERE id=?", (job_id,)).fetchone()
         if not job or not job["office_ticket_id"]:
             return
         ticket = conn.execute(
@@ -213,15 +212,19 @@ def dispatch_office_ticket(ticket_id: str, payload: DispatchRequest) -> dict[str
                 payload.profile,
                 payload.device_serial,
                 timestamp,
-                json.dumps(data, default=str),
+                timestamp,
+                None,
                 payload.technician_id,
                 ticket_id,
-                "SYNCED",
             ),
         )
         conn.execute(
             "UPDATE office_tickets SET job_id=?, status='DISPATCHED', updated_at=? WHERE id=?",
             (job_id, timestamp, ticket_id),
+        )
+        conn.execute(
+            "UPDATE jobs SET office_system=?, office_ticket_id=? WHERE id=?",
+            (data["system"], ticket_id, job_id),
         )
 
     record_event(job_id, "office", "DISPATCHED", {"ticket_id": ticket_id, "technician_id": payload.technician_id})
@@ -281,7 +284,9 @@ def submit_field_job(job_id: str, payload: FieldSubmission) -> dict[str, Any]:
         if row["claimed_by"] and row["claimed_by"] != payload.technician_id:
             raise HTTPException(status_code=409, detail="Job is assigned to another technician")
 
-        checklist_complete = all(item.get("value") in {"pass", "issue"} for item in payload.checklist)
+        checklist_complete = bool(payload.checklist) and all(
+            item.get("value") in {"pass", "issue"} for item in payload.checklist
+        )
         evidence_present = len(payload.evidence) > 0
         trusted_completion = payload.gps_verified and payload.technician_verified and payload.customer_signoff
         if not payload.submit_with_exception and (not checklist_complete or not evidence_present or not trusted_completion):
